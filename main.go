@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 const (
@@ -160,9 +161,47 @@ func (c *conn) frame(obj, opcode uint32, args [][]byte) []byte {
 	return msg
 }
 
+var debug = os.Getenv("SCREENDRAW_DEBUG") != ""
+
+func init() {
+	level := slog.LevelInfo
+	if debug {
+		level = slog.LevelDebug
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+}
+
+// The timestamp of the last traced wire message
+var tracePrev time.Time
+
+func traceWire(dir string, attrs ...any) {
+	if !debug {
+		return
+	}
+	now := time.Now()
+
+	var dus int64
+	if !tracePrev.IsZero() {
+		dus = now.Sub(tracePrev).Microseconds()
+	}
+	tracePrev = now
+
+	slog.Debug(dir, append([]any{"+us", dus}, attrs...)...)
+}
+
+func span(name string) func() {
+	if !debug {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		slog.Debug("span", "name", name, "us", time.Since(start).Microseconds())
+	}
+}
+
 func (c *conn) request(obj, opcode uint32, args ...[]byte) {
 	msg := c.frame(obj, opcode, args)
-	slog.Debug("request", "obj", obj, "op", opcode, "size", len(msg), "body", msg[8:])
+	traceWire("request", "obj", obj, "op", opcode, "size", len(msg), "body", msg[8:])
 
 	if _, err := c.uc.Write(msg); err != nil {
 		slog.Error("Write request", "err", err)
@@ -174,7 +213,7 @@ func (c *conn) requestFD(obj, opcode uint32, fd int, args ...[]byte) {
 	oob := syscall.UnixRights(fd)
 
 	msg := c.frame(obj, opcode, args)
-	slog.Debug("request+fd", "obj", obj, "op", opcode, "size", len(msg), "fd", fd, "body", msg[8:])
+	traceWire("request+fd", "obj", obj, "op", opcode, "size", len(msg), "fd", fd, "body", msg[8:])
 
 	if _, _, err := c.uc.WriteMsgUnix(msg, oob, nil); err != nil {
 		slog.Error("Write request with fd", "err", err)
@@ -236,7 +275,7 @@ func (c *conn) read() (uint32, uint32, []byte) {
 	body := append([]byte(nil), c.rbuf[8:size]...)
 	c.rbuf = append([]byte(nil), c.rbuf[size:]...)
 
-	slog.Debug("event", "obj", obj, "op", op, "size", size, "body", body)
+	traceWire("event", "obj", obj, "op", op, "size", size, "body", body)
 
 	if obj == idDisplay && op == 0 { // wl_display.error
 		eObj, code := readU32(body, 0), readU32(body, 4)
@@ -344,6 +383,7 @@ func clamp(v, lo, hi int) int {
 // ----------------------------------------------------------------------------
 
 func dimAll(dst, orig []byte, shade int) {
+	defer span("dimAll")()
 	for o := 0; o+3 < len(orig); o += 4 {
 		dst[o+0] = byte(int(orig[o+0]) * shade >> 8)
 		dst[o+1] = byte(int(orig[o+1]) * shade >> 8)
@@ -353,6 +393,7 @@ func dimAll(dst, orig []byte, shade int) {
 }
 
 func paintSelection(mem, base, orig []byte, stride, w, h int, s sel) {
+	defer span("paintSelection")()
 	copy(mem, base)
 	if s.empty() {
 		return
