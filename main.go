@@ -505,21 +505,6 @@ func (c *conn) redraw(mem, base, orig []byte, w, h, stride int, s sel, more bool
 	c.request(idSurface, 6)                                               // commit
 }
 
-func (c *conn) fadeTick(mem, base, orig []byte, w, h, stride int, s sel, shade int) int {
-	if shade <= shadeDim {
-		return shade
-	}
-
-	shade -= fadeStep
-	if shade < shadeDim {
-		shade = shadeDim
-	}
-	dimAll(base, orig, shade)
-	c.redraw(mem, base, orig, w, h, stride, s, shade > shadeDim)
-
-	return shade
-}
-
 func (c *conn) fadeOut(mem, orig []byte, w, h, stride int) {
 	base := make([]byte, len(orig))
 
@@ -577,20 +562,46 @@ func (c *conn) selectRegion(orig, mem []byte, w, h, stride int) (sel, bool) {
 
 	base := make([]byte, len(orig))
 	dimAll(base, orig, shade)
-	c.redraw(mem, base, orig, w, h, stride, d.s, true)
+
+	dirty := true         // needs a repaint this frame
+	framePending := false // a frame callback is in flight
+
+	requestFrame := func() {
+		fading := shade > shadeDim
+		if fading {
+			shade -= fadeStep
+			if shade < shadeDim {
+				shade = shadeDim
+			}
+			dimAll(base, orig, shade)
+		}
+		c.redraw(mem, base, orig, w, h, stride, d.s, true)
+		dirty = false
+		framePending = true
+	}
+	requestFrame()
 
 	for {
 		id, op, body := c.read()
 
 		switch id {
 		case idCallback:
-			if op == evDone {
-				shade = c.fadeTick(mem, base, orig, w, h, stride, d.s, shade)
+			if op != evDone {
+				break
+			}
+			framePending = false
+
+			if dirty || shade > shadeDim {
+				requestFrame()
 			}
 		case idPointer:
 			done, ok := d.pointer(op, body, w, h)
 			if d.active {
-				c.redraw(mem, base, orig, w, h, stride, d.s, false)
+				dirty = true
+
+				if !framePending {
+					requestFrame()
+				}
 			}
 			if done {
 				return d.s, ok
