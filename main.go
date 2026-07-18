@@ -14,17 +14,18 @@ import (
 )
 
 const (
-	idDisplay    = 1
-	idRegistry   = 2
-	idSync       = 3
-	idShm        = 4
-	idScreencopy = 5
-	idDataCtl    = 6
-	idSeat       = 7
-	idCompositor = 8
-	idLayerShell = 9
-	idXdgOutput  = 10
-	idDynamic    = 11
+	idDisplay     = 1
+	idRegistry    = 2
+	idSync        = 3
+	idShm         = 4
+	idScreencopy  = 5
+	idDataCtl     = 6
+	idSeat        = 7
+	idCompositor  = 8
+	idLayerShell  = 9
+	idXdgOutput   = 10
+	idCursorShape = 11
+	idDynamic     = 12
 )
 
 const (
@@ -71,6 +72,9 @@ const (
 	keyEscape    = 1
 	statePressed = 1 // wl_keyboard key + wl_pointer button
 )
+
+// wp_cursor_shape_device_v1 shape enum
+const shapeCrosshair = 8
 
 const (
 	shadeFull = 256
@@ -145,6 +149,8 @@ type conn struct {
 	objs   map[uint32]objRef
 
 	pointerID, keyboardID, dataDevID, sourceID uint32
+	cursorDevID                                uint32
+	hasCursorShape                             bool
 }
 
 type objRef struct {
@@ -556,6 +562,10 @@ type drag struct {
 func (c *conn) pointer(d *drag, outs []*output, bb sel, op uint32, body []byte) (done, confirmed bool) {
 	switch op {
 	case evEnter:
+		if c.cursorDevID != 0 {
+			serial := readU32(body, 0)
+			c.request(c.cursorDevID, 1, u32(serial), u32(shapeCrosshair)) // set_shape
+		}
 		if i, role, ok := c.decode(readU32(body, 4)); ok && role == roleSurface {
 			d.over = outs[i]
 		}
@@ -641,6 +651,11 @@ func (c *conn) configureOverlay(outs []*output) {
 	c.request(idSeat, 0, u32(c.pointerID)) // wl_seat.get_pointer
 	c.keyboardID = c.allocID()
 	c.request(idSeat, 1, u32(c.keyboardID)) // wl_seat.get_keyboard
+
+	if c.hasCursorShape {
+		c.cursorDevID = c.allocID()
+		c.request(idCursorShape, 1, u32(c.cursorDevID), u32(c.pointerID)) // get_pointer
+	}
 
 	for _, o := range outs {
 		sid := c.newObj(o, roleSurface)
@@ -953,6 +968,14 @@ func (c *conn) setup() ([]*output, uint32) {
 
 		return ver
 	}
+	bindOptionally := func(iface string, newID, cap uint32) bool {
+		if _, ok := globals[iface]; !ok {
+			return false
+		}
+		bind(iface, newID, cap)
+		return true
+	}
+
 	bind("wl_shm", idShm, 1)
 	scVer := bind("zwlr_screencopy_manager_v1", idScreencopy, 3)
 	bind("ext_data_control_manager_v1", idDataCtl, 1)
@@ -960,6 +983,8 @@ func (c *conn) setup() ([]*output, uint32) {
 	bind("wl_compositor", idCompositor, 4)
 	bind("zwlr_layer_shell_v1", idLayerShell, 1)
 	bind("zxdg_output_manager_v1", idXdgOutput, 3)
+
+	c.hasCursorShape = bindOptionally("wp_cursor_shape_manager_v1", idCursorShape, 1)
 
 	if len(outNames) == 0 {
 		slog.Error("No wl_output advertised")
