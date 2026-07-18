@@ -23,17 +23,19 @@ const (
 	idSeat       = 7
 	idCompositor = 8
 	idLayerShell = 9
-	idDynamic    = 10
+	idXdgOutput  = 10
+	idDynamic    = 11
 )
 
 const (
-	roleOutput = iota // wl_output
-	roleFrame         // zwlr_screencopy_frame_v1
-	rolePool          // wl_shm_pool
-	roleBuffer        // wl_buffer
-	roleSurface       // wl_surface
-	roleLayer         // zwlr_layer_surface_v1
-	roleCallback      // wl_callback (frame)
+	roleOutput    = iota // wl_output
+	roleFrame            // zwlr_screencopy_frame_v1
+	rolePool             // wl_shm_pool
+	roleBuffer           // wl_buffer
+	roleSurface          // wl_surface
+	roleLayer            // zwlr_layer_surface_v1
+	roleCallback         // wl_callback (frame)
+	roleXdgOutput        // zxdg_output_v1
 	roleCount
 )
 
@@ -59,6 +61,8 @@ const (
 	evButton = 3
 	// wl_callback
 	evDone = 0
+	// zxdg_output_v1
+	evLogicalPosition = 0
 )
 
 const (
@@ -661,9 +665,9 @@ func (c *conn) configureOverlay(outs []*output) {
 		switch op {
 		case evLayerConfigure:
 			serial := readU32(body, 0)
-			c.request(id, 6, u32(serial))                                                       // ack_configure
+			c.request(id, 6, u32(serial))                                                      // ack_configure
 			c.request(outs[i].id(roleSurface), 1, u32(outs[i].id(roleBuffer)), u32(0), u32(0)) // attach
-			c.request(outs[i].id(roleSurface), 6)                                               // commit
+			c.request(outs[i].id(roleSurface), 6)                                              // commit
 			pending--
 		case evLayerClosed:
 			slog.Error("Compositor closed the overlay")
@@ -738,8 +742,8 @@ func (c *conn) selectRegion(outs []*output) (sel, bool) {
 	for {
 		id, op, body := c.read()
 
-		switch {
-		case id == c.pointerID:
+		switch id {
+		case c.pointerID:
 			done, ok := c.pointer(&d, outs, bb, op, body)
 			if d.active {
 				dirty = true
@@ -751,7 +755,7 @@ func (c *conn) selectRegion(outs []*output) (sel, bool) {
 			if done {
 				return d.s, ok
 			}
-		case id == c.keyboardID:
+		case c.keyboardID:
 			if op != evKey {
 				break
 			}
@@ -955,6 +959,7 @@ func (c *conn) setup() ([]*output, uint32) {
 	bind("wl_seat", idSeat, 1)
 	bind("wl_compositor", idCompositor, 4)
 	bind("zwlr_layer_shell_v1", idLayerShell, 1)
+	bind("zxdg_output_manager_v1", idXdgOutput, 3)
 
 	if len(outNames) == 0 {
 		slog.Error("No wl_output advertised")
@@ -966,6 +971,9 @@ func (c *conn) setup() ([]*output, uint32) {
 		outs[i] = &output{name: name, idx: i}
 		oid := c.newObj(outs[i], roleOutput)
 		c.request(idRegistry, 0, u32(name), newIDArg("wl_output", 1, oid))
+
+		xid := c.newObj(outs[i], roleXdgOutput)
+		c.request(idXdgOutput, 1, u32(xid), u32(oid)) // get_xdg_output
 	}
 
 	c.request(idDisplay, 0, u32(idSync))
@@ -975,22 +983,28 @@ func (c *conn) setup() ([]*output, uint32) {
 			break
 		}
 		i, role, ok := c.decode(id)
-		if !ok || role != roleOutput {
+		if !ok {
 			continue
 		}
-		switch op {
-		case 0: // geometry: x, y, ...
-			outs[i].x = int(int32(readU32(body, 0)))
-			outs[i].y = int(int32(readU32(body, 4)))
-		case 1: // mode: flags, width, height, refresh
-			if readU32(body, 0)&1 != 0 { // current mode
-				outs[i].w = int(int32(readU32(body, 4)))
-				outs[i].h = int(int32(readU32(body, 8)))
+		switch role {
+		case roleOutput:
+			c.readOutputGeometry(outs[i], op, body)
+		case roleXdgOutput:
+			if op == evLogicalPosition {
+				outs[i].x = int(int32(readU32(body, 0)))
+				outs[i].y = int(int32(readU32(body, 4)))
 			}
 		}
 	}
 
 	return outs, scVer
+}
+
+func (c *conn) readOutputGeometry(o *output, op uint32, body []byte) {
+	if op == 1 && readU32(body, 0)&1 != 0 { // mode, current
+		o.w = int(int32(readU32(body, 4)))
+		o.h = int(int32(readU32(body, 8)))
+	}
 }
 
 func (c *conn) shmBuffer(o *output, w, h, stride, format uint32) ([]byte, *os.File) {
