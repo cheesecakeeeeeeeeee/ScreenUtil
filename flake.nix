@@ -14,6 +14,24 @@
         pkgs = nixpkgs.legacyPackages.${system};
       in
       {
+        packages.default = pkgs.buildGoModule {
+          pname = "screenutil";
+          version = "0.1.0";
+          src = ./.;
+          vendorHash = null;
+
+          ldflags = [
+            "-s"
+            "-w"
+          ];
+
+          meta = {
+            description = "Wayland screenshot/region selection utility";
+            mainProgram = "screenutil";
+            platforms = pkgs.lib.platforms.linux;
+          };
+        };
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             go
