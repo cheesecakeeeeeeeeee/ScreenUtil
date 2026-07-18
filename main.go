@@ -14,30 +14,27 @@ import (
 )
 
 const (
-	// wl_display
-	idDisplay = 1
-	// Client owns everything from here
-	idRegistry = 2
-	idSync     = 3
-	// These constants must be numbered in the exact order the objects are
-	// created at runtime with no gaps
+	idDisplay    = 1
+	idRegistry   = 2
+	idSync       = 3
 	idShm        = 4
-	idOutput     = 5
-	idScreencopy = 6
-	idDataCtl    = 7
-	idSeat       = 8
-	idCompositor = 9
-	idLayerShell = 10
-	idFrame      = 11
-	idPool       = 12
-	idBuffer     = 13
-	idPointer    = 14
-	idKeyboard   = 15
-	idSurface    = 16
-	idLayerSurf  = 17
-	idCallback   = 18
-	idDataDev    = 19
-	idSource     = 20
+	idScreencopy = 5
+	idDataCtl    = 6
+	idSeat       = 7
+	idCompositor = 8
+	idLayerShell = 9
+	idDynamic    = 10
+)
+
+const (
+	roleOutput = iota // wl_output
+	roleFrame         // zwlr_screencopy_frame_v1
+	rolePool          // wl_shm_pool
+	roleBuffer        // wl_buffer
+	roleSurface       // wl_surface
+	roleLayer         // zwlr_layer_surface_v1
+	roleCallback      // wl_callback (frame)
+	roleCount
 )
 
 const (
@@ -68,7 +65,7 @@ const (
 	keyEnter     = 28
 	keyKpEnter   = 96
 	keyEscape    = 1
-	statePressed = 1 // wl_keyboard key + wl_pointer button: pressed
+	statePressed = 1 // wl_keyboard key + wl_pointer button
 )
 
 const (
@@ -139,6 +136,34 @@ type conn struct {
 	rbuf []byte
 	// These are recv via SCM_RIGHTS and consumed in order
 	fds []int
+
+	nextID uint32
+	objs   map[uint32]objRef
+
+	pointerID, keyboardID, dataDevID, sourceID uint32
+}
+
+type objRef struct {
+	idx  int
+	role int
+}
+
+func (c *conn) allocID() uint32 {
+	id := c.nextID
+	c.nextID++
+	return id
+}
+
+func (c *conn) newObj(o *output, role int) uint32 {
+	id := c.allocID()
+	o.ids[role] = id
+	c.objs[id] = objRef{o.idx, role}
+	return id
+}
+
+func (c *conn) decode(id uint32) (idx, role int, ok bool) {
+	ref, ok := c.objs[id]
+	return ref.idx, ref.role, ok
 }
 
 func (c *conn) frame(obj, opcode uint32, args [][]byte) []byte {
@@ -171,7 +196,7 @@ func init() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }
 
-// The timestamp of the last traced wire message
+// Timestamp of the last traced wire message.
 var tracePrev time.Time
 
 func traceWire(dir string, attrs ...any) {
@@ -193,6 +218,7 @@ func span(name string) func() {
 	if !debug {
 		return func() {}
 	}
+
 	start := time.Now()
 	return func() {
 		slog.Debug("span", "name", name, "us", time.Since(start).Microseconds())
@@ -285,7 +311,7 @@ func (c *conn) read() (uint32, uint32, []byte) {
 		os.Exit(1)
 	}
 
-	if obj == idKeyboard && op == evKeymap {
+	if obj == c.keyboardID && op == evKeymap {
 		c.dropHeadFD()
 	}
 
@@ -293,14 +319,66 @@ func (c *conn) read() (uint32, uint32, []byte) {
 }
 
 // ----------------------------------------------------------------------------
+// Outputs
+// ----------------------------------------------------------------------------
+
+// This is one monitor, and also its position in the global compositor space
+// and its captured pixels
+type output struct {
+	// Registry global name
+	name uint32
+	idx  int
+	x, y int
+	// Comes from the screencopy frame
+	w, h int
+	// Also comes from the screencopy frame
+	stride int
+	format uint32
+
+	// Shm buffer shared with the compositor (also the surface's attached buffer)
+	mem  []byte
+	file *os.File
+	// Untouched capture
+	orig []byte
+	// Orig dimmed at the current shade
+	base []byte
+
+	ids [roleCount]uint32
+}
+
+func (o *output) id(role int) uint32 { return o.ids[role] }
+
+func (o *output) region() sel {
+	return sel{o.x, o.y, o.x + o.w, o.y + o.h}
+}
+
+func bounds(outs []*output) sel {
+	b := outs[0].region()
+	for _, o := range outs[1:] {
+		b.x0 = min(b.x0, o.x)
+		b.y0 = min(b.y0, o.y)
+		b.x1 = max(b.x1, o.x+o.w)
+		b.y1 = max(b.y1, o.y+o.h)
+	}
+	return b
+}
+
+func intersects(o *output, s sel) bool {
+	if s.empty() {
+		return false
+	}
+	return s.x0 < o.x+o.w && s.x1 > o.x && s.y0 < o.y+o.h && s.y1 > o.y
+}
+
+// ----------------------------------------------------------------------------
 // Capture
 // ----------------------------------------------------------------------------
 
-func (c *conn) captureParams(scVer uint32) (format, w, h, stride uint32) {
+func (c *conn) captureParams(scVer uint32, frameID uint32) (format, w, h, stride uint32) {
 	for {
 		id, op, body := c.read()
 
-		if id == idFrame {
+		if id == frameID {
 			switch op {
 			case evBuffer:
 				if f := readU32(body, 0); f == shmARGB || f == shmXRGB {
@@ -324,11 +402,11 @@ func (c *conn) captureParams(scVer uint32) (format, w, h, stride uint32) {
 	}
 }
 
-func (c *conn) waitReady() (yInvert bool) {
+func (c *conn) waitReady(frameID uint32) (yInvert bool) {
 	for {
 		id, op, body := c.read()
 
-		if id == idFrame {
+		if id == frameID {
 			switch op {
 			case evFlags:
 				yInvert = readU32(body, 0)&1 != 0
@@ -342,10 +420,33 @@ func (c *conn) waitReady() (yInvert bool) {
 	}
 }
 
+// Grabs every output into its own shm buffer sequentially.
+func (c *conn) captureAll(outs []*output, scVer uint32) {
+	for _, o := range outs {
+		frameID := c.newObj(o, roleFrame)
+
+		// capture_output(frame, overlay_cursor=0, output)
+		c.request(idScreencopy, 0, u32(frameID), u32(0), u32(o.id(roleOutput)))
+		format, w, h, stride := c.captureParams(scVer, frameID)
+
+		o.format, o.w, o.h, o.stride = format, int(w), int(h), int(stride)
+		o.mem, o.file = c.shmBuffer(o, w, h, stride, format)
+
+		c.request(frameID, 0, u32(o.id(roleBuffer))) // frame.copy
+		if c.waitReady(frameID) {
+			flipRows(o.mem, o.stride, o.h)
+		}
+
+		o.orig = append([]byte(nil), o.mem...)
+		o.base = make([]byte, len(o.mem))
+	}
+}
+
 // ----------------------------------------------------------------------------
 // Selection
 // ----------------------------------------------------------------------------
 
+// Rectangle in the global compositor coordinate space.
 type sel struct {
 	x0, y0, x1, y1 int
 }
@@ -354,11 +455,14 @@ func (s sel) empty() bool {
 	return s.x0 >= s.x1 || s.y0 >= s.y1
 }
 
-func selFrom(ax, ay, bx, by, w, h int) sel {
+func selFrom(ax, ay, bx, by int, bb sel) sel {
 	x0, x1 := order(ax, bx)
 	y0, y1 := order(ay, by)
 
-	return sel{clamp(x0, 0, w), clamp(y0, 0, h), clamp(x1, 0, w), clamp(y1, 0, h)}
+	return sel{
+		clamp(x0, bb.x0, bb.x1), clamp(y0, bb.y0, bb.y1),
+		clamp(x1, bb.x0, bb.x1), clamp(y1, bb.y0, bb.y1),
+	}
 }
 
 func order(a, b int) (int, int) {
@@ -392,29 +496,35 @@ func dimAll(dst, orig []byte, shade int) {
 	}
 }
 
-func paintSelection(mem, base, orig []byte, stride, w, h int, s sel) {
-	defer span("paintSelection")()
-	copy(mem, base)
-	if s.empty() {
+func paintOutput(o *output, s sel) {
+	defer span("paintOutput")()
+	copy(o.mem, o.base)
+
+	gx0, gy0 := max(s.x0, o.x), max(s.y0, o.y)
+	gx1, gy1 := min(s.x1, o.x+o.w), min(s.y1, o.y+o.h)
+	if s.empty() || gx0 >= gx1 || gy0 >= gy1 {
+		// Selection does not touch this output
 		return
 	}
-	for y := s.y0; y < s.y1; y++ {
-		row := y * stride
-		copy(mem[row+s.x0*4:row+s.x1*4], orig[row+s.x0*4:row+s.x1*4])
+
+	for gy := gy0; gy < gy1; gy++ {
+		row := (gy - o.y) * o.stride
+		lo, hi := row+(gx0-o.x)*4, row+(gx1-o.x)*4
+		copy(o.mem[lo:hi], o.orig[lo:hi])
 	}
-	borderDraw(mem, stride, w, h, s)
+	borderClipped(o, s, gx0, gy0, gx1, gy1)
 }
 
-func borderDraw(mem []byte, stride, w, h int, s sel) {
-	top, bot := s.y0, min(s.y1, h)
-	left, right := s.x0, min(s.x1, w)
+func borderClipped(o *output, s sel, gx0, gy0, gx1, gy1 int) {
+	for gy := gy0; gy < gy1; gy++ {
+		onH := gy < s.y0+borderW || gy >= s.y1-borderW
+		row := (gy - o.y) * o.stride
 
-	for y := top; y < bot; y++ {
-		onEdge := y < top+borderW || y >= bot-borderW
-		row := y * stride
-		for x := left; x < right; x++ {
-			if onEdge || x < left+borderW || x >= right-borderW {
-				borderPixel(mem, row+x*4)
+		for gx := gx0; gx < gx1; gx++ {
+			onV := gx < s.x0+borderW || gx >= s.x1-borderW
+
+			if onH || onV {
+				borderPixel(o.mem, row+(gx-o.x)*4)
 			}
 		}
 	}
@@ -430,22 +540,28 @@ func borderPixel(mem []byte, o int) {
 
 type drag struct {
 	s sel
-	// Anchor set on button down
+	// Anchor set on button down, in global coords
 	ax, ay int
-	// Last pointer position
-	lx, ly int
+	// Last pointer position, in global coords
+	gx, gy int
 	active bool
+	// Output the pointer is currently over (set by enter)
+	over *output
 }
 
-func (d *drag) pointer(op uint32, body []byte, w, h int) (done, confirmed bool) {
+func (c *conn) pointer(d *drag, outs []*output, bb sel, op uint32, body []byte) (done, confirmed bool) {
 	switch op {
 	case evEnter:
-		d.lx, d.ly = fixedXY(body, 8)
+		if i, role, ok := c.decode(readU32(body, 4)); ok && role == roleSurface {
+			d.over = outs[i]
+		}
+		lx, ly := fixedXY(body, 8)
+		d.setGlobal(lx, ly)
 	case evMotion:
-		d.lx, d.ly = fixedXY(body, 4)
-
+		lx, ly := fixedXY(body, 4)
+		d.setGlobal(lx, ly)
 		if d.active {
-			d.s = selFrom(d.ax, d.ay, d.lx, d.ly, w, h)
+			d.s = selFrom(d.ax, d.ay, d.gx, d.gy, bb)
 		}
 	case evButton:
 		return d.press(readU32(body, 12) == statePressed)
@@ -454,9 +570,16 @@ func (d *drag) pointer(op uint32, body []byte, w, h int) (done, confirmed bool) 
 	return false, false
 }
 
+func (d *drag) setGlobal(lx, ly int) {
+	if d.over == nil {
+		return
+	}
+	d.gx, d.gy = lx+d.over.x, ly+d.over.y
+}
+
 func (d *drag) press(down bool) (done, confirmed bool) {
 	if down {
-		d.ax, d.ay = d.lx, d.ly
+		d.ax, d.ay = d.gx, d.gy
 		d.s = sel{}
 		d.active = true
 
@@ -494,30 +617,78 @@ func keyAction(body []byte, hasSelection bool) (done, confirmed bool) {
 // Overlay
 // ----------------------------------------------------------------------------
 
-func (c *conn) redraw(mem, base, orig []byte, w, h, stride int, s sel, more bool) {
-	paintSelection(mem, base, orig, stride, w, h, s)
+// Publishes one output's curernt bufer
+func (c *conn) commitOutput(o *output, clock bool) {
+	sid := o.id(roleSurface)
 
-	if more {
-		c.request(idSurface, 3, u32(idCallback)) // wl_surface.frame
+	if clock {
+		if o.ids[roleCallback] == 0 {
+			c.newObj(o, roleCallback)
+		}
+		c.request(sid, 3, u32(o.id(roleCallback))) // wl_surface.frame
 	}
-	c.request(idSurface, 1, u32(idBuffer), u32(0), u32(0))                // attach
-	c.request(idSurface, 2, i32(0), i32(0), i32(int32(w)), i32(int32(h))) // damage
-	c.request(idSurface, 6)                                               // commit
+	c.request(sid, 1, u32(o.id(roleBuffer)), u32(0), u32(0))            // attach
+	c.request(sid, 2, i32(0), i32(0), i32(int32(o.w)), i32(int32(o.h))) // damage
+	c.request(sid, 6)                                                   // commit
 }
 
-func (c *conn) fadeOut(mem, orig []byte, w, h, stride int) {
-	base := make([]byte, len(orig))
+func (c *conn) configureOverlay(outs []*output) {
+	c.pointerID = c.allocID()
+	c.request(idSeat, 0, u32(c.pointerID)) // wl_seat.get_pointer
+	c.keyboardID = c.allocID()
+	c.request(idSeat, 1, u32(c.keyboardID)) // wl_seat.get_keyboard
+
+	for _, o := range outs {
+		sid := c.newObj(o, roleSurface)
+		c.request(idCompositor, 0, u32(sid)) // wl_compositor.create_surface
+
+		lid := c.newObj(o, roleLayer)
+		// get_layer_surface(id, surface, output, layer=overlay, namespace).
+		c.request(idLayerShell, 0, u32(lid), u32(sid), u32(o.id(roleOutput)), u32(3), str("screenutil"))
+		c.request(lid, 1, u32(1|2|4|8)) // set_anchor(top|bottom|left|right)
+		c.request(lid, 2, i32(-1))      // set_exclusive_zone(-1)
+		c.request(lid, 4, u32(1))       // set_keyboard_interactivity(exclusive)
+		c.request(sid, 6)               // commit
+	}
+
+	for pending := len(outs); pending > 0; {
+		id, op, body := c.read()
+		i, role, ok := c.decode(id)
+		if !ok || role != roleLayer {
+			continue
+		}
+
+		switch op {
+		case evLayerConfigure:
+			serial := readU32(body, 0)
+			c.request(id, 6, u32(serial))                                                       // ack_configure
+			c.request(outs[i].id(roleSurface), 1, u32(outs[i].id(roleBuffer)), u32(0), u32(0)) // attach
+			c.request(outs[i].id(roleSurface), 6)                                               // commit
+			pending--
+		case evLayerClosed:
+			slog.Error("Compositor closed the overlay")
+			os.Exit(1)
+		}
+	}
+}
+
+func (c *conn) fadeOut(outs []*output) {
+	clock := outs[0]
 
 	for shade := shadeDim + fadeStep; ; shade += fadeStep {
 		last := shade >= shadeFull
 		if last {
 			shade = shadeFull
 		}
-		dimAll(base, orig, shade)
-		c.redraw(mem, base, orig, w, h, stride, sel{}, true)
+		for _, o := range outs {
+			dimAll(o.base, o.orig, shade)
+			paintOutput(o, sel{})
+			c.commitOutput(o, o == clock)
+		}
 
-		for { // block until this frame's done, so it is actually on screen
-			if id, op, _ := c.read(); id == idCallback && op == evDone {
+		for { // block until the clock frame is presented
+			id, op, _ := c.read()
+			if i, role, ok := c.decode(id); ok && role == roleCallback && i == clock.idx && op == evDone {
 				break
 			}
 		}
@@ -527,96 +698,84 @@ func (c *conn) fadeOut(mem, orig []byte, w, h, stride int) {
 	}
 }
 
-func (c *conn) configureOverlay() {
-	c.request(idSeat, 0, u32(idPointer))  // wl_seat.get_pointer
-	c.request(idSeat, 1, u32(idKeyboard)) // wl_seat.get_keyboard
+func (c *conn) selectRegion(outs []*output) (sel, bool) {
+	clock := outs[0]
+	bb := bounds(outs)
 
-	c.request(idCompositor, 0, u32(idSurface)) // wl_compositor.create_surface
-
-	// get_layer_surface(id, surface, output=null, layer=overlay, namespace)
-	c.request(idLayerShell, 0, u32(idLayerSurf), u32(idSurface), u32(0), u32(3), str("screenutil"))
-	c.request(idLayerSurf, 1, u32(1|2|4|8)) // set_anchor(top|bottom|left|right)
-	c.request(idLayerSurf, 2, i32(-1))      // set_exclusive_zone(-1)
-	c.request(idLayerSurf, 4, u32(1))       // set_keyboard_interactivity(exclusive)
-	c.request(idSurface, 6)                 // commit (triggers configure)
-
-	for {
-		id, op, body := c.read()
-		if id == idLayerSurf && op == evLayerConfigure {
-			serial := readU32(body, 0)
-			c.request(idLayerSurf, 6, u32(serial))                 // ack_configure
-			c.request(idSurface, 1, u32(idBuffer), u32(0), u32(0)) // attach
-			c.request(idSurface, 6)                                // commit
-			return
-		}
-		if id == idLayerSurf && op == evLayerClosed {
-			slog.Error("Compositor closed the freeze overlay")
-			os.Exit(1)
-		}
-	}
-}
-
-func (c *conn) selectRegion(orig, mem []byte, w, h, stride int) (sel, bool) {
 	var d drag
 	shade := shadeFull
+	for _, o := range outs {
+		dimAll(o.base, o.orig, shade)
+	}
 
-	base := make([]byte, len(orig))
-	dimAll(base, orig, shade)
+	dirty := true
+	framePending := false
+	painted := sel{} // selection last committed, to know which outputs to clear
 
-	dirty := true         // needs a repaint this frame
-	framePending := false // a frame callback is in flight
-
-	requestFrame := func() {
+	tick := func() {
 		fading := shade > shadeDim
 		if fading {
 			shade -= fadeStep
 			if shade < shadeDim {
 				shade = shadeDim
 			}
-			dimAll(base, orig, shade)
+			for _, o := range outs {
+				dimAll(o.base, o.orig, shade)
+			}
 		}
-		c.redraw(mem, base, orig, w, h, stride, d.s, true)
+		for _, o := range outs {
+			if fading || o == clock || intersects(o, d.s) || intersects(o, painted) {
+				paintOutput(o, d.s)
+				c.commitOutput(o, o == clock)
+			}
+		}
+		painted = d.s
 		dirty = false
 		framePending = true
 	}
-	requestFrame()
+	tick()
 
 	for {
 		id, op, body := c.read()
 
-		switch id {
-		case idCallback:
-			if op != evDone {
-				break
-			}
-			framePending = false
-
-			if dirty || shade > shadeDim {
-				requestFrame()
-			}
-		case idPointer:
-			done, ok := d.pointer(op, body, w, h)
+		switch {
+		case id == c.pointerID:
+			done, ok := c.pointer(&d, outs, bb, op, body)
 			if d.active {
 				dirty = true
 
-				if !framePending {
-					requestFrame()
+				if !framePending { // callback loop stalled
+					tick()
 				}
 			}
 			if done {
 				return d.s, ok
 			}
-		case idKeyboard:
+		case id == c.keyboardID:
 			if op != evKey {
 				break
 			}
 			if done, ok := keyAction(body, !d.s.empty()); done {
 				return d.s, ok
 			}
-		case idLayerSurf:
-			if op == evLayerClosed {
-				slog.Error("Compositor closed the region overlay")
-				os.Exit(1)
+		default:
+			i, role, ok := c.decode(id)
+			if !ok {
+				break
+			}
+			switch role {
+			case roleCallback:
+				if op == evDone && i == clock.idx {
+					framePending = false
+					if dirty || shade > shadeDim {
+						tick()
+					}
+				}
+			case roleLayer:
+				if op == evLayerClosed {
+					slog.Error("Compositor closed the overlay")
+					os.Exit(1)
+				}
 			}
 		}
 	}
@@ -626,14 +785,22 @@ func (c *conn) selectRegion(orig, mem []byte, w, h, stride int) (sel, bool) {
 // Encode
 // ----------------------------------------------------------------------------
 
-func regionPNG(orig []byte, stride int, s sel, format uint32) []byte {
+func regionPNG(outs []*output, s sel) []byte {
 	w, h := s.x1-s.x0, s.y1-s.y0
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 
-	for y := 0; y < h; y++ {
-		row := (s.y0 + y) * stride
-		for x := 0; x < w; x++ {
-			pixelBGRA(img, x, y, orig, row+(s.x0+x)*4, format == shmARGB)
+	for _, o := range outs {
+		gx0, gy0 := max(s.x0, o.x), max(s.y0, o.y)
+		gx1, gy1 := min(s.x1, o.x+o.w), min(s.y1, o.y+o.h)
+		if gx0 >= gx1 || gy0 >= gy1 {
+			continue
+		}
+
+		for gy := gy0; gy < gy1; gy++ {
+			row := (gy - o.y) * o.stride
+			for gx := gx0; gx < gx1; gx++ {
+				pixelBGRA(img, gx-s.x0, gy-s.y0, o.orig, row+(gx-o.x)*4, o.format == shmARGB)
+			}
 		}
 	}
 
@@ -673,15 +840,17 @@ func flipRows(mem []byte, stride, h int) {
 // ----------------------------------------------------------------------------
 
 func (c *conn) serveClipboard(pngBytes []byte) {
-	c.request(idDataCtl, 1, u32(idDataDev), u32(idSeat)) // get_data_device
-	c.request(idDataCtl, 0, u32(idSource))               // create_data_source
-	c.request(idSource, 0, str("image/png"))             // source.offer
-	c.request(idDataDev, 0, u32(idSource))               // device.set_selection
+	c.dataDevID = c.allocID()
+	c.request(idDataCtl, 1, u32(c.dataDevID), u32(idSeat)) // get_data_device
+	c.sourceID = c.allocID()
+	c.request(idDataCtl, 0, u32(c.sourceID))   // create_data_source
+	c.request(c.sourceID, 0, str("image/png")) // source.offer
+	c.request(c.dataDevID, 0, u32(c.sourceID)) // device.set_selection
 
 	for {
 		id, op, _ := c.read()
 
-		if id != idSource {
+		if id != c.sourceID {
 			continue
 		}
 
@@ -740,13 +909,15 @@ func dial() *conn {
 		os.Exit(1)
 	}
 
-	return &conn{uc: uc}
+	return &conn{uc: uc, nextID: idDynamic, objs: map[uint32]objRef{}}
 }
 
-func (c *conn) bindGlobals() (scVer uint32) {
+func (c *conn) setup() ([]*output, uint32) {
 	c.request(idDisplay, 1, u32(idRegistry)) // wl_display.get_registry
 	c.request(idDisplay, 0, u32(idSync))     // wl_display.sync
+
 	globals := map[string][2]uint32{}
+	var outNames []uint32
 
 	for {
 		id, op, body := c.read()
@@ -756,7 +927,9 @@ func (c *conn) bindGlobals() (scVer uint32) {
 			iface, off := readStr(body, 4)
 			ver := readU32(body, off)
 
-			if _, seen := globals[iface]; !seen {
+			if iface == "wl_output" {
+				outNames = append(outNames, name)
+			} else if _, seen := globals[iface]; !seen {
 				globals[iface] = [2]uint32{name, ver}
 			}
 		} else if id == idSync && op == 0 { // callback.done
@@ -777,17 +950,50 @@ func (c *conn) bindGlobals() (scVer uint32) {
 		return ver
 	}
 	bind("wl_shm", idShm, 1)
-	bind("wl_output", idOutput, 1)
-	scVer = bind("zwlr_screencopy_manager_v1", idScreencopy, 3)
+	scVer := bind("zwlr_screencopy_manager_v1", idScreencopy, 3)
 	bind("ext_data_control_manager_v1", idDataCtl, 1)
 	bind("wl_seat", idSeat, 1)
 	bind("wl_compositor", idCompositor, 4)
 	bind("zwlr_layer_shell_v1", idLayerShell, 1)
 
-	return scVer
+	if len(outNames) == 0 {
+		slog.Error("No wl_output advertised")
+		os.Exit(1)
+	}
+
+	outs := make([]*output, len(outNames))
+	for i, name := range outNames {
+		outs[i] = &output{name: name, idx: i}
+		oid := c.newObj(outs[i], roleOutput)
+		c.request(idRegistry, 0, u32(name), newIDArg("wl_output", 1, oid))
+	}
+
+	c.request(idDisplay, 0, u32(idSync))
+	for {
+		id, op, body := c.read()
+		if id == idSync && op == 0 {
+			break
+		}
+		i, role, ok := c.decode(id)
+		if !ok || role != roleOutput {
+			continue
+		}
+		switch op {
+		case 0: // geometry: x, y, ...
+			outs[i].x = int(int32(readU32(body, 0)))
+			outs[i].y = int(int32(readU32(body, 4)))
+		case 1: // mode: flags, width, height, refresh
+			if readU32(body, 0)&1 != 0 { // current mode
+				outs[i].w = int(int32(readU32(body, 4)))
+				outs[i].h = int(int32(readU32(body, 8)))
+			}
+		}
+	}
+
+	return outs, scVer
 }
 
-func (c *conn) shmBuffer(w, h, stride, format uint32) ([]byte, *os.File) {
+func (c *conn) shmBuffer(o *output, w, h, stride, format uint32) ([]byte, *os.File) {
 	size := int(stride * h)
 
 	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "screenutil-*")
@@ -808,8 +1014,11 @@ func (c *conn) shmBuffer(w, h, stride, format uint32) ([]byte, *os.File) {
 		os.Exit(1)
 	}
 
-	c.requestFD(idShm, 0, int(f.Fd()), u32(idPool), u32(uint32(size)))
-	c.request(idPool, 0, u32(idBuffer), u32(0), u32(w), u32(h), u32(stride), u32(format))
+	poolID := c.newObj(o, rolePool)
+	c.requestFD(idShm, 0, int(f.Fd()), u32(poolID), u32(uint32(size)))
+
+	bufID := c.newObj(o, roleBuffer)
+	c.request(poolID, 0, u32(bufID), u32(0), u32(w), u32(h), u32(stride), u32(format))
 
 	return mem, f
 }
@@ -818,39 +1027,25 @@ func main() {
 	c := dial()
 	defer c.uc.Close()
 
-	scVer := c.bindGlobals()
+	outs, scVer := c.setup()
+	c.captureAll(outs, scVer)
 
-	// Capture the first output into a shared buffer
-	c.request(idScreencopy, 0, u32(idFrame), u32(0), u32(idOutput))
-	format, w, h, stride := c.captureParams(scVer)
+	c.configureOverlay(outs)
+	region, confirmed := c.selectRegion(outs)
 
-	mem, f := c.shmBuffer(w, h, stride, format)
-	c.request(idFrame, 0, u32(idBuffer)) // zwlr_screencopy_frame_v1.copy
-	yInvert := c.waitReady()
+	c.fadeOut(outs) // ease the overlay back to the desktop
 
-	iw, ih, istride := int(w), int(h), int(stride)
-
-	if yInvert {
-		flipRows(mem, istride, ih)
+	for _, o := range outs {
+		c.request(o.id(roleLayer), 7)   // zwlr_layer_surface_v1.destroy
+		c.request(o.id(roleSurface), 0) // wl_surface.destroy
+		syscall.Munmap(o.mem)
+		o.file.Close()
 	}
-
-	orig := make([]byte, len(mem))
-	copy(orig, mem)
-
-	c.configureOverlay()
-	region, confirmed := c.selectRegion(orig, mem, iw, ih, istride)
-
-	c.fadeOut(mem, orig, iw, ih, istride) // ease the overlay back to the desktop
-
-	c.request(idLayerSurf, 7) // zwlr_layer_surface_v1.destroy
-	c.request(idSurface, 0)   // wl_surface.destroy
-	syscall.Munmap(mem)
-	f.Close()
 
 	if !confirmed {
 		slog.Info("cancelled")
 		return
 	}
 
-	c.serveClipboard(regionPNG(orig, istride, region, format))
+	c.serveClipboard(regionPNG(outs, region))
 }
