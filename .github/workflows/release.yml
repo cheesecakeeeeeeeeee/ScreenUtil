@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: 'stable' }
+      - name: Build
+        run: |
+          VER=${GITHUB_REF_NAME}
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$VER" \
+              -o screenutil-linux-$arch .
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: screenutil-linux-*
