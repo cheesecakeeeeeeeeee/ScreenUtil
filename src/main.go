@@ -212,6 +212,10 @@ func (c *conn) read() (uint32, uint32, []byte) {
 		os.Exit(1)
 	}
 
+	if obj == idKeyboard && op == evKeymap {
+		c.dropHeadFD()
+	}
+
 	return obj, op, body
 }
 
@@ -274,11 +278,6 @@ func (c *conn) waitKey() bool {
 		}
 
 		switch op {
-		case evKeymap:
-			if len(c.fds) > 0 {
-				syscall.Close(c.fds[0])
-				c.fds = c.fds[1:]
-			}
 		case evKey:
 			// key(serial, time, key, state)
 			key := readU32(body, 8)
@@ -293,6 +292,13 @@ func (c *conn) waitKey() bool {
 				return false
 			}
 		}
+	}
+}
+
+func (c *conn) dropHeadFD() {
+	if len(c.fds) > 0 {
+		syscall.Close(c.fds[0])
+		c.fds = c.fds[1:]
 	}
 }
 
@@ -490,9 +496,11 @@ func main() {
 				c.fds = c.fds[1:]
 
 				out := os.NewFile(uintptr(fd), "clip")
-				out.Write(pngBytes)
+				n, err := out.Write(pngBytes)
 				out.Close()
-			case evCancelled: // someone else took the clipboard
+				slog.Info("Served clipboard data", "bytes", n, "err", err)
+			case evCancelled:
+				slog.Warn("Data source cancelled by compositor")
 				return
 			}
 		}
