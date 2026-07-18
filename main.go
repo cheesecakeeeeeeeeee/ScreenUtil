@@ -161,7 +161,7 @@ func (c *conn) frame(obj, opcode uint32, args [][]byte) []byte {
 	return msg
 }
 
-var debug = os.Getenv("SCREENDRAW_DEBUG") != ""
+var debug = os.Getenv("SCREENUTIL_DEBUG") != ""
 
 func init() {
 	level := slog.LevelInfo
