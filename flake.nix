@@ -15,7 +15,7 @@
       in
       {
         packages.default = pkgs.buildGoModule {
-          pname = "screenutil";
+          pname = "goshot";
           version = "0.1.0";
           src = ./.;
           vendorHash = null;
