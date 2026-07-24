@@ -1,11 +1,2 @@
-This is part of the Cheesecake Go Software™
-Distributed under MIT license, see [LICENSE.md](LICENSE.md) for details.
-
-Simple and minimal screen utilities:
-* Screenshotter
-* Screenrecorder
-* Screen... drawer?
-These utilities are designed to look nice everywhere, as they have no GUI and everything is
-build on keyboard.
-
-Note that these run only on Wayland.
+Goshot is a simple screenshotting utility for Wayland.
+Goshot is licensed under MIT license. See [LICENSE.md](LICENSE.md) for details.
