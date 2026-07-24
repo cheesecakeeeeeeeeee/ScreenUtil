@@ -26,8 +26,8 @@
           ];
 
           meta = {
-            description = "Wayland screenshot/region selection utility";
-            mainProgram = "screenutil";
+            description = "Simple screenshoter for Wayland";
+            mainProgram = "goshot";
             platforms = pkgs.lib.platforms.linux;
           };
         };

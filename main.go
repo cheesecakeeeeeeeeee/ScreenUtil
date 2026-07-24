@@ -7,7 +7,7 @@ import (
 	"log/slog"
 	"os"
 
-	"screenutil/internal/overlay"
+	"goshot/internal/overlay"
 )
 
 func main() {

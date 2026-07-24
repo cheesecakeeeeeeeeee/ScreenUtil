@@ -17,8 +17,8 @@ jobs:
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=$VER" \
-              -o screenutil-linux-$arch .
+              -o goshot-linux-$arch .
           done
       - uses: softprops/action-gh-release@v2
         with:
-          files: screenutil-linux-*
+          files: goshot-linux-*

@@ -194,7 +194,7 @@ func (c *conn) frame(obj, opcode uint32, args [][]byte) []byte {
 	return msg
 }
 
-var debug = os.Getenv("SCREENUTIL_DEBUG") != ""
+var debug = os.Getenv("GOSHOT_DEBUG") != ""
 
 func init() {
 	level := slog.LevelInfo
@@ -661,7 +661,7 @@ func (c *conn) configureOverlay(outs []*output) {
 
 		lid := c.newObj(o, roleLayer)
 		// get_layer_surface(id, surface, output, layer=overlay, namespace).
-		c.request(idLayerShell, 0, u32(lid), u32(sid), u32(o.id(roleOutput)), u32(3), str("screenutil"))
+		c.request(idLayerShell, 0, u32(lid), u32(sid), u32(o.id(roleOutput)), u32(3), str("goshot"))
 		c.request(lid, 1, u32(1|2|4|8)) // set_anchor(top|bottom|left|right)
 		c.request(lid, 2, i32(-1))      // set_exclusive_zone(-1)
 		c.request(lid, 4, u32(1))       // set_keyboard_interactivity(exclusive)
@@ -1028,7 +1028,7 @@ func (c *conn) readOutputGeometry(o *output, op uint32, body []byte) {
 func (c *conn) shmBuffer(o *output, w, h, stride, format uint32) ([]byte, *os.File) {
 	size := int(stride * h)
 
-	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "screenutil-*")
+	f, err := os.CreateTemp(os.Getenv("XDG_RUNTIME_DIR"), "goshot-*")
 	if err != nil {
 		slog.Error("Create shm temp file", "err", err)
 		os.Exit(1)
